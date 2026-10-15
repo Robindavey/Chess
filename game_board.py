@@ -180,9 +180,16 @@ def make_move(board : list[Piece], move : tuple, piece:Piece, state : dict, mate
     if type(piece) == Pawn:
         piece.first_move = False
     piece.position = move
-def minimax(board : list[Piece], me:int, depth=4, maximise = True, material=material):
+def set_material(board : list[Piece]):
+    m = [0,0,0]
+    for b in board:
+        if type(b) != King:
+            m[b.side + 1]+=equate(b)
+    return m
+def minimax(board : list[Piece], depth=4, maximise = True):
     h = []
     i = 0
+    material = set_material(board)
     best_score, best_move, best_board = float("-inf"), None, None
     heapq.heappush(h,(0, i ,(board, 0, maximise, None, WHITE)))
     while h:
@@ -206,6 +213,6 @@ def minimax(board : list[Piece], me:int, depth=4, maximise = True, material=mate
     return best_score, best_move, best_board
 
     #print()
-a,b,c = minimax(board_state, 1, depth=5)
+a,b,c = minimax(board_state, depth=4)
 print(a,b)
 print_board(c)
