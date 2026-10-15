@@ -5,6 +5,15 @@ BLACK = -1
 BOARD_LIMITS = (8,8)
 MAX_INT = 1000000
 material = [4*3 + 8 + 10 + 9] * 3
+gridded = [[ -50, -40, -30, -30, -30, -30, -40, -50 ],
+[ -40, -20,   0,   5,   5,   0, -20, -40 ],
+[ -30,   5,  10,  15,  15,  10,   5, -30 ],
+[ -30,   0,  15,  20,  20,  15,   0, -30 ],
+[ -30,   5,  15,  20,  20,  15,   5, -30 ],
+[ -30,   0,  10,  15,  15,  10,   0, -30 ],
+[ -40, -20,   0,   0,   0,   0, -20, -40 ],
+[ -50, -40, -30, -30, -30, -30, -40, -50 ]]
+gridded = [[x/100 for x in g] for g in gridded]
 class Piece:
     __slots__ = ("position", "side")
     def __init__(self, position, side):
@@ -127,13 +136,13 @@ board_state = [
     Rook((7,0), BLACK), Knight((7,1), BLACK), Bishop((7,2), BLACK), Queen((7,3), BLACK),
     King((7,4), BLACK), Bishop((7,5), BLACK), Knight((7,6), BLACK), Rook((7,7), BLACK),
 ]
-puzzle = [
+"""puzzle = [
     King((0,6), WHITE),
     Rook((0,0), WHITE),
     Rook((1,1), WHITE),
     King((7,4), BLACK),
 ]
-board_state = puzzle
+board_state = puzzle"""
 def make_states_and_owner(board):
     game_state_set = {}
     ownership = {}
@@ -171,48 +180,117 @@ def equate(c : Piece):
         return 1
     if type(c) == Bishop:
         return 3
-def make_move(board : list[Piece], move : tuple, piece:Piece, state : dict, materials :list) -> None:
+def eval_board(board):
+    output = 0
+    for p in board:
+        output += (equate(p) + gridded[p.position[0]][p.position[1]]) * p.side
+    return output
+def make_move(board : list[Piece], move : tuple, piece:Piece, state : dict) -> None:
     if move in state:
         #this is then an attack
         opp = state[move]
         board.remove(opp)
-        materials[piece.side * -1 + 1] -= equate(opp)
     if type(piece) == Pawn:
         piece.first_move = False
     piece.position = move
-def set_material(board : list[Piece]):
-    m = [0,0,0]
-    for b in board:
-        if type(b) != King:
-            m[b.side + 1]+=equate(b)
-    return m
-def minimax(board : list[Piece], depth=4, maximise = True):
-    h = []
-    i = 0
-    material = set_material(board)
-    best_score, best_move, best_board = float("-inf"), None, None
-    heapq.heappush(h,(0, i ,(board, 0, maximise, None, WHITE)))
-    while h:
-        pri,counter, combo = heapq.heappop(h)
-        cur, d, maximise, first, colour = combo
-        white_legal_moves, black_legal_moves = get_all_legal_moves(cur)
-        legal_moves = white_legal_moves if colour == WHITE else black_legal_moves
-        for legal_block in legal_moves:
-            for l in legal_block[0]:
-                if d < depth:
-                    new_board = [b.copy() for b in cur]
-                    state_dict, owners = make_states_and_owner(new_board)
-                    make_move(new_board, l, state_dict[legal_block[1].position],state_dict, materials=[m for m in material])
-                    fm = first if d > 0 else (legal_block[1].position, l)
-                    if material[0]-material[2] if maximise else material[2]-material[0] > best_score:
-                        best_score,best_move, best_board = material[0]-material[2] if maximise else material[2]-material[0], fm, new_board
-                    heapq.heappush(h, (material[0]-material[2] if maximise else material[2]-material[0],i%1463783, (new_board,d+1, not maximise, fm, BLACK if colour == WHITE else WHITE)))
-                    print(f"depth = {d}")
-                    #print_board(new_board)
-                    i += 1
-    return best_score, best_move, best_board
+def white_minimax(board: list[Piece], depth, maximise, alpha, beta):
+    """Returns (value, best_move, best_board).
+    best_move  = (piece, move) chosen at this node (None at leaves / no moves)
+    best_board = leaf board at the end of the best line from this node
+    """
+    if depth == 0:
+        return eval_board(board), None, board
 
-    #print()
-a,b,c = minimax(board_state, depth=4)
-print(a,b)
-print_board(c)
+    white_legal_moves, black_legal_moves = get_all_legal_moves(board)
+    legal_moves = white_legal_moves if maximise else black_legal_moves
+
+    bestVal = -MAX_INT if maximise else MAX_INT
+    bestMove = None
+    bestBoard = board          # fallback if there are no legal moves
+
+    for moves, piece in legal_moves:
+        for move in moves:
+            new_board = [b.copy() for b in board]
+            state_dict, owners = make_states_and_owner(new_board)
+            make_move(new_board, move, state_dict[piece.position], state_dict)
+
+            value, _, leaf_board = white_minimax(new_board, depth - 1, not maximise, alpha, beta)
+
+            if maximise:
+                if value > bestVal:
+                    bestVal, bestMove, bestBoard = value, (piece, move), leaf_board
+                alpha = max(alpha, bestVal)
+            else:
+                if value < bestVal:
+                    bestVal, bestMove, bestBoard = value, (piece, move), leaf_board
+                beta = min(beta, bestVal)
+
+            if beta <= alpha:
+                return bestVal, bestMove, bestBoard
+
+    return bestVal, bestMove, bestBoard
+def black_minimax(board: list[Piece], depth, maximise, alpha, beta):
+    """Returns (value, best_move, best_board).
+    best_move  = (piece, move) chosen at this node (None at leaves / no moves)
+    best_board = leaf board at the end of the best line from this node
+    """
+    if depth == 0:
+        return eval_board(board), None, board
+
+    white_legal_moves, black_legal_moves = get_all_legal_moves(board)
+    legal_moves = black_legal_moves if maximise else white_legal_moves
+
+    bestVal = -MAX_INT if maximise else MAX_INT
+    bestMove = None
+    bestBoard = board
+
+    for moves, piece in legal_moves:
+        for move in moves:
+            new_board = [b.copy() for b in board]
+            state_dict, owners = make_states_and_owner(new_board)
+            make_move(new_board, move, state_dict[piece.position], state_dict)
+
+            value, _, leaf_board = white_minimax(new_board, depth - 1, not maximise, alpha, beta)
+
+            if maximise:
+                if value > bestVal:
+                    bestVal, bestMove, bestBoard = value, (piece, move), leaf_board
+                alpha = max(alpha, bestVal)
+            else:
+                if value < bestVal:
+                    bestVal, bestMove, bestBoard = value, (piece, move), leaf_board
+                beta = min(beta, bestVal)
+
+            if beta <= alpha:
+                return bestVal, bestMove, bestBoard
+
+    return bestVal, bestMove, bestBoard
+import time
+def sim_game(board):
+    score = 0
+    white = True
+    while score < 100:
+        start_time = time.perf_counter()
+        et = time.perf_counter()
+        iter_deep = 3
+        last_et = time.perf_counter()
+        if white:
+            while et - start_time  < 4.5:
+                
+                last_et = et
+                print(iter_deep, last_et - start_time)
+                score,(p, bm),__ = white_minimax(board, iter_deep, True, -MAX_INT, MAX_INT)
+                iter_deep +=1
+                et = time.perf_counter()
+        else:
+            while et-start_time  < 4.5:
+                last_et = et
+                print(iter_deep, last_et - start_time)
+
+                score,(p, bm),__ = black_minimax(board, iter_deep, True, -MAX_INT, MAX_INT)
+                iter_deep +=1
+                et = time.perf_counter()
+        p.position = bm
+        white = not white
+        print_board(board)
+sim_game(board_state)
