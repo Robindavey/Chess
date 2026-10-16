@@ -9,6 +9,7 @@ Set ENGINE_PATH to point at a differently named/located engine binary.
 """
 from __future__ import annotations
 
+import math
 import os
 import subprocess
 import threading
@@ -72,18 +73,19 @@ class Engine:
     def status(self, pos: str):
         """-> (white_in_check, black_in_check, moves for the side to move)."""
         parts = self._ask(f"status {pos}").split()
-        moves = [tuple(map(int, p.split(","))) for p in parts[3:]]
+        moves = [(int(f), int(t), promo) for f, t, promo in (p.split(",") for p in parts[3:])]
         return parts[1] == "1", parts[2] == "1", moves
 
     def go(self, pos: str, seconds: float):
         parts = self._ask(f"go {pos} {seconds:.3f}").split()
         if parts[1] == "none":
             return None
-        return int(parts[1]), int(parts[2]), int(parts[3]), int(parts[4])  # from, to, score, depth
+        promotion = None if parts[5] == "-" else parts[5]
+        return int(parts[1]), int(parts[2]), int(parts[3]), int(parts[4]), promotion
 
-    def apply(self, pos: str, f: int, t: int) -> str:
-        """Let the engine apply a move (it handles castling, en passant and rights)."""
-        return self._ask(f"apply {pos} {f} {t}")[len("state "):]
+    def apply(self, pos: str, f: int, t: int, promotion: str | None = None) -> str:
+        """Let the engine apply a move, including special-move state updates."""
+        return self._ask(f"apply {pos} {f} {t} {promotion or '-'}")[len("state "):]
 
 
 engine = Engine(ENGINE_PATH)
@@ -102,10 +104,10 @@ def board_and_turn() -> tuple[str, str]:
     return board, turn
 
 
-def play(f: int, t: int) -> None:
+def play(f: int, t: int, promotion: str | None = None) -> None:
     board, turn = board_and_turn()
     captured = board[t]
-    game["pos"] = engine.apply(game["pos"], f, t)
+    game["pos"] = engine.apply(game["pos"], f, t, promotion)
     game["last"] = [f, t]
     if captured in "kK":
         game["winner"] = turn
@@ -119,8 +121,8 @@ def ai_move_if_needed() -> None:
     if result is None:
         game["winner"] = "draw"
         return
-    f, t, score, depth = result
-    play(f, t)
+    f, t, score, depth, promotion = result
+    play(f, t, promotion)
     game["ai"] = {"from": f, "to": t, "score": score, "depth": depth}
 
 
@@ -167,11 +169,24 @@ def api_state():
 def api_new():
     data = request.get_json(force=True, silent=True) or {}
     human = "b" if data.get("side") == "black" else "w"
-    seconds = min(max(float(data.get("seconds", 1.0)), 0.1), 30.0)
+    try:
+        seconds = requested_seconds(data, 1.0)
+    except ValueError:
+        return jsonify(error="invalid think time"), 400
     with game_lock:
         new_game(human, seconds)
         ai_move_if_needed()  # AI opens if the human chose Black
         return jsonify(payload())
+
+
+def requested_seconds(data: dict, default: float) -> float:
+    try:
+        seconds = float(data.get("seconds", default))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("invalid think time") from exc
+    if not math.isfinite(seconds):
+        raise ValueError("invalid think time")
+    return min(max(seconds, 0.1), 900.0)
 
 
 @app.post("/api/move")
@@ -184,9 +199,17 @@ def api_move():
     with game_lock:
         if not game or game["winner"] or board_and_turn()[1] != game["human"]:
             return jsonify(error="not your turn"), 409
-        if (f, t) not in engine.status(game["pos"])[2]:
+        promotion = data.get("promotion", "-")
+        if not isinstance(promotion, str) or promotion.lower() not in {"-", "q", "r", "b", "n"}:
+            return jsonify(error="invalid promotion"), 400
+        promotion = promotion.lower()
+        if (f, t, promotion) not in engine.status(game["pos"])[2]:
             return jsonify(error="illegal move"), 400
-        play(f, t)
+        try:
+            game["seconds"] = requested_seconds(data, game["seconds"])
+        except ValueError:
+            return jsonify(error="invalid think time"), 400
+        play(f, t, None if promotion == "-" else promotion)
         ai_move_if_needed()
         return jsonify(payload())
 

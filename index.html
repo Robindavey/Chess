@@ -51,7 +51,10 @@
       <option value="3">3 s</option>
       <option value="8">8 s (hard)</option>
       <option value="15">15 s (beats 1575)</option>
-      <option value="15">60 s (super hard)</option>
+      <option value="60">60 s (super hard)</option>
+      <option value="120">2 mins (insane)</option>
+      <option value="300">5 mins (insane)</option>
+      <option value="900">Pointless (insane)</option>
     </select>
   </label>
   <button id="new">New game</button>
@@ -120,9 +123,9 @@ function render() {
   else status = state.check.includes(state.board.indexOf(humanKing)) ? "Your move \u2013 your king is in check!" : "Your move";
   $("status").textContent = status;
 
-  $("info").textContent = state.ai
-    ? `AI played ${name(state.ai.from)} \u2192 ${name(state.ai.to)} \u00b7 depth ${state.ai.depth} \u00b7 eval ${(state.ai.score / 100).toFixed(2)} (AI's view)`
-    : "";
+  $("info").textContent = `${state.ai
+    ? `AI played ${name(state.ai.from)} \u2192 ${name(state.ai.to)} \u00b7 depth ${state.ai.depth} \u00b7 eval ${(state.ai.score / 100).toFixed(2)} (AI's view) \u00b7 `
+    : ""}Think limit: ${state.seconds} s`;
 }
 
 async function onClick(sq) {
@@ -136,7 +139,7 @@ async function onClick(sq) {
 }
 
 // Mirror the move locally (incl. castling and en passant) so the board updates instantly.
-function applyLocal(board, from, to) {
+function applyLocal(board, from, to, promotion = "-") {
   const b = board.slice(), piece = b[from].toLowerCase();
   if (piece === "k" && Math.abs((to % 8) - (from % 8)) === 2) {          // castling: move the rook too
     const row = from - (from % 8);
@@ -145,19 +148,33 @@ function applyLocal(board, from, to) {
   }
   if (piece === "p" && from % 8 !== to % 8 && b[to] === ".")              // en passant: remove the pawn
     b[state.human === "w" ? to - 8 : to + 8] = ".";
-  b[to] = b[from]; b[from] = ".";
+  const promotedPiece = promotion === "-" ? b[from] : (b[from] === b[from].toUpperCase() ? promotion.toUpperCase() : promotion);
+  b[to] = promotedPiece; b[from] = ".";
   return b;
 }
 
 async function makeMove(from, to) {
+  const movingPiece = state.board[from];
+  const reachesLastRank = movingPiece.toLowerCase() === "p" &&
+    (movingPiece === movingPiece.toUpperCase() ? to >= 56 : to < 8);
+  let promotion = "-";
+  if (reachesLastRank) {
+    promotion = window.prompt("Promote to queen (Q), rook (R), bishop (B), or knight (N):", "Q");
+    if (promotion === null) return;
+    promotion = promotion.trim().toLowerCase();
+    if (!["q", "r", "b", "n"].includes(promotion)) {
+      $("err").textContent = "Choose Q, R, B, or N for pawn promotion.";
+      return;
+    }
+  }
   busy = true;
   $("err").textContent = "";
   // Show the human's move immediately while the engine thinks.
-  state = { ...state, board: applyLocal(state.board, from, to), last: [from, to], check: [], legal: [] };
+  state = { ...state, board: applyLocal(state.board, from, to, promotion), last: [from, to], check: [], legal: [] };
   selected = null;
   render();
   try {
-    state = await api("/api/move", { from, to });
+    state = await api("/api/move", { from, to, promotion, seconds: parseFloat($("secs").value) });
   } catch (e) {
     $("err").textContent = e.message;
     state = await api("/api/state");

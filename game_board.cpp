@@ -2,12 +2,11 @@
 // Self-play:      ./game_board [seconds_per_move=4.5] [max_plies=100]
 // Server (Flask): ./game_board --serve      (line protocol on stdin/stdout, see serve())
 //
-// Rules: pseudo-legal moves + castling (not out of / through / into check) + en passant.
-// Still no promotion, and leaving your king attacked is allowed (the king can be captured).
+// Rules: pseudo-legal moves + castling (not out of / through / into check), en passant,
+// and promotion. Leaving your king attacked is allowed (the king can be captured).
 //
-// Same rules/eval as the Python version (pseudo-legal moves, no promotion,
-// no castling/en passant, king capture ends the game, same material +
-// positional table), but with a much faster engine underneath.
+// The Python reference has simpler move rules (no promotion, castling, or
+// en passant); king capture ends the game in both implementations.
 
 #include <algorithm>
 #include <array>
@@ -147,13 +146,15 @@ inline U64 bishopAttacks(int sq, U64 occ) {
 // Moves and position
 // ---------------------------------------------------------------------------
 struct Move {
-    std::uint8_t from = 64, to = 64, piece = NONE, captured = NONE, flag = F_NONE;
+    std::uint8_t from = 64, to = 64, piece = NONE, captured = NONE, flag = F_NONE, promotion = NONE;
     Move() = default;
-    Move(int f, int t, int p, int c, int fl = F_NONE)
+    Move(int f, int t, int p, int c, int fl = F_NONE, int promo = NONE)
         : from(static_cast<std::uint8_t>(f)), to(static_cast<std::uint8_t>(t)),
           piece(static_cast<std::uint8_t>(p)), captured(static_cast<std::uint8_t>(c)),
-          flag(static_cast<std::uint8_t>(fl)) {}
-    std::uint16_t packed() const { return static_cast<std::uint16_t>(from | (to << 6)); }
+          flag(static_cast<std::uint8_t>(fl)), promotion(static_cast<std::uint8_t>(promo)) {}
+    std::uint16_t packed() const {
+        return static_cast<std::uint16_t>(from | (to << 6) | (promotion << 12));
+    }
 };
 
 struct Undo {
@@ -313,7 +314,14 @@ struct Position {
             while (tg) {
                 const int to = std::countr_zero(tg);
                 tg &= tg - 1;
-                out[n++] = Move(to - delta, to, PAWN, board[to], flag);
+                const int from = to - delta;
+                const bool promotes = us == WHITE ? (to >> 3) == 7 : (to >> 3) == 0;
+                if (promotes) {
+                    for (int promo : {QUEEN, ROOK, BISHOP, KNIGHT})
+                        out[n++] = Move(from, to, PAWN, board[to], flag, promo);
+                } else {
+                    out[n++] = Move(from, to, PAWN, board[to], flag);
+                }
             }
         };
 
@@ -408,6 +416,13 @@ struct Position {
         occ[us] ^= f | t;
         board[m.from] = NONE;
         board[m.to] = m.piece;
+        if (m.promotion != NONE) {
+            bb[us][PAWN] ^= t;
+            bb[us][m.promotion] ^= t;
+            hash ^= T.zobrist[us][PAWN][m.to] ^ T.zobrist[us][m.promotion][m.to];
+            eval += sign * (T.score[m.promotion][m.to] - T.score[PAWN][m.to]);
+            board[m.to] = m.promotion;
+        }
 
         if (m.flag == F_CASTLE) {
             const bool kingside = m.to > m.from;
@@ -446,9 +461,15 @@ struct Position {
             board[rt] = NONE;
             board[rf] = ROOK;
         }
-        bb[us][m.piece] ^= f | t;
+        if (m.promotion != NONE) {
+            bb[us][m.promotion] ^= t;
+            bb[us][PAWN] ^= f;
+            board[m.from] = PAWN;
+        } else {
+            bb[us][m.piece] ^= f | t;
+            board[m.from] = m.piece;
+        }
         occ[us] ^= f | t;
-        board[m.from] = m.piece;
         board[m.to] = NONE;
         if (m.captured != NONE) {
             const int capSq = m.flag == F_EP ? (us == WHITE ? m.to - 8 : m.to + 8) : m.to;
@@ -502,12 +523,22 @@ public:
         deadline_ = start_ + std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(seconds));
         stop_ = false;
         nodes_ = 0;
+        for (auto& ply : killers_)
+            for (auto& killer : ply) killer = 0;
         for (auto& a : history_) for (auto& b : a) for (auto& h : b) h /= 2;
 
         Result best;
         for (rootDepth_ = 1; rootDepth_ <= maxDepth; ++rootDepth_) {
-            rootBest_ = Move();
-            const int score = search(rootDepth_, -INF, INF, 0);
+            int window = rootDepth_ == 1 ? INF : 50;
+            int score = 0;
+            while (true) {
+                const int alpha = std::max(-INF, best.score - window);
+                const int beta = std::min(INF, best.score + window);
+                rootBest_ = Move();
+                score = search(rootDepth_, alpha, beta, 0);
+                if (stop_ || window == INF || (score > alpha && score < beta)) break;
+                window = std::min(INF, window * 2);
+            }
             if (stop_ && rootDepth_ > 1) break;  // discard the unfinished iteration
             if (rootBest_.from == 64) break;     // no moves
             best = {rootBest_, score, rootDepth_, true};
@@ -552,7 +583,8 @@ private:
     // MVV-LVA: most valuable victim first, cheapest attacker first. King capture sorts first.
     static int captureScore(const Move& m) {
         static constexpr int victim[6] = {1, 3, 3, 5, 9, 100};
-        return 100'000 + victim[m.captured] * 16 - m.piece;
+        return 100'000 + victim[m.captured] * 16 - m.piece +
+               (m.promotion == NONE ? 0 : PIECE_VALUE[m.promotion]);
     }
 
     int quiesce(int alpha, int beta, int ply) {
@@ -610,11 +642,19 @@ private:
         for (int i = 0; i < n; ++i) {
             if (ttMove && mv[i].packed() == ttMove) sc[i] = 1'000'000;
             else if (mv[i].captured != NONE) sc[i] = captureScore(mv[i]);
-            else sc[i] = history_[us][mv[i].from][mv[i].to];
+            else if (mv[i].promotion != NONE)
+                sc[i] = 100'000 + PIECE_VALUE[mv[i].promotion];
+            else if (ply < MAX_PLY && mv[i].packed() == killers_[ply][0])
+                sc[i] = 90'000;
+            else if (ply < MAX_PLY && mv[i].packed() == killers_[ply][1])
+                sc[i] = 80'000;
+            else
+                sc[i] = history_[us][mv[i].from][mv[i].to];
         }
 
         int best = -INF;
         Move bestMove;
+        int searched = 0;
         for (int i = 0; i < n; ++i) {
             pickBest(mv, sc, n, i);
             const Move m = mv[i];
@@ -623,9 +663,17 @@ private:
                 return MATE - ply;
             }
             const Undo u = pos_.make(m);
-            const int s = -search(depth - 1, -beta, -alpha, ply + 1);
+            int s;
+            if (searched == 0) {
+                s = -search(depth - 1, -beta, -alpha, ply + 1);
+            } else {
+                s = -search(depth - 1, -alpha - 1, -alpha, ply + 1);
+                if (s > alpha && s < beta)
+                    s = -search(depth - 1, -beta, -alpha, ply + 1);
+            }
             pos_.unmake(m, u);
             if (stop_) return 0;
+            ++searched;
 
             if (s > best) {
                 best = s;
@@ -636,7 +684,13 @@ private:
                 }
             }
             if (alpha >= beta) {
-                if (m.captured == NONE) history_[us][m.from][m.to] += depth * depth;
+                if (m.captured == NONE && m.promotion == NONE) {
+                    if (ply < MAX_PLY && m.packed() != killers_[ply][0]) {
+                        killers_[ply][1] = killers_[ply][0];
+                        killers_[ply][0] = m.packed();
+                    }
+                    history_[us][m.from][m.to] += depth * depth;
+                }
                 break;
             }
         }
@@ -652,6 +706,7 @@ private:
     Position pos_;
     std::vector<TTEntry> tt_;
     U64 mask_;
+    std::uint16_t killers_[MAX_PLY][2]{};
     int history_[2][64][64]{};
     Move rootBest_;
     int rootDepth_ = 0;
@@ -682,9 +737,9 @@ Position simGame(Position position, double moveTime = 4.5, int maxPlies = 100) {
 // ---------------------------------------------------------------------------
 // Server mode: one command per line on stdin, one reply per line on stdout.
 // <state> is four tokens: "<board64> <w|b> <castling KQkq|-> <ep square|->".
-//   status <state>              -> "status <whiteInCheck> <blackInCheck> f,t f,t ..." (side to move's moves)
-//   go     <state> <seconds>    -> "bestmove f t score depth" | "bestmove none"
-//   apply  <state> <from> <to>  -> "state <new state>"   (handles castling / en passant)
+//   status <state>              -> "status <whiteInCheck> <blackInCheck> f,t,p ..."
+//   go     <state> <seconds>    -> "bestmove f t score depth promotion" | "bestmove none"
+//   apply  <state> <from> <to> <promotion|-> -> "state <new state>"
 //   ping                        -> "pong"
 //   quit
 // Squares are 0..63 (row*8+col, row 0 = white back rank).
@@ -724,7 +779,10 @@ void serve() {
             Move mv[256];
             const int n = p.generate<false>(mv);
             std::cout << "status " << p.kingAttacked(WHITE) << ' ' << p.kingAttacked(BLACK);
-            for (int i = 0; i < n; ++i) std::cout << ' ' << int(mv[i].from) << ',' << int(mv[i].to);
+            static constexpr char sym[6] = {'p', 'n', 'b', 'r', 'q', 'k'};
+            for (int i = 0; i < n; ++i)
+                std::cout << ' ' << int(mv[i].from) << ',' << int(mv[i].to) << ','
+                          << (mv[i].promotion == NONE ? '-' : sym[mv[i].promotion]);
             std::cout << std::endl;
         } else if (cmd == "go") {
             double seconds = 1.0;
@@ -734,15 +792,27 @@ void serve() {
                 std::cout << "bestmove none" << std::endl;
             else
                 std::cout << "bestmove " << int(r.move.from) << ' ' << int(r.move.to) << ' ' << r.score << ' '
-                          << r.depth << std::endl;
+                          << r.depth << ' '
+                          << (r.move.promotion == NONE ? '-' : "pnbrqk"[r.move.promotion]) << std::endl;
         } else {
             int from = -1, to = -1;
-            in >> from >> to;
+            char promotion = '-';
+            in >> from >> to >> promotion;
+            int promotionPiece = NONE;
+            switch (promotion) {
+                case 'q': promotionPiece = QUEEN; break;
+                case 'r': promotionPiece = ROOK; break;
+                case 'b': promotionPiece = BISHOP; break;
+                case 'n': promotionPiece = KNIGHT; break;
+                case '-': break;
+                default: break;
+            }
             Move mv[256];
             const int n = p.generate<false>(mv);
             bool done = false;
             for (int i = 0; i < n && !done; ++i)
-                if (mv[i].from == from && mv[i].to == to) {
+                if (mv[i].from == from && mv[i].to == to && mv[i].promotion == promotionPiece &&
+                    (promotion == '-' || promotionPiece != NONE)) {
                     p.make(mv[i]);
                     std::cout << "state " << p.toState() << std::endl;
                     done = true;
