@@ -53,6 +53,15 @@ class Move:
     to_square: int
 
 
+@dataclass(frozen=True, slots=True)
+class MoveUndo:
+    move: Move
+    side: int
+    piece: int
+    captured_piece: tuple[int, int] | None
+    previous_side_to_move: int
+
+
 class Board:
     """Chess position stored as 12 piece bitboards, indexed by color and type."""
 
@@ -175,22 +184,37 @@ class Board:
                 if not own & (1 << target):
                     moves.append(Move(source, target))
 
-    def make_move(self, move: Move) -> Board:
+    def make_move(self, move: Move) -> MoveUndo:
         moving_piece = self.piece_at(move.from_square)
         if moving_piece is None:
             raise ValueError(f"No piece on source square {move.from_square}")
         side, piece = moving_piece
         color = self._color_index(side)
-        next_board = Board(self.bitboards, -side)
+        captured_piece = self.piece_at(move.to_square)
+        if captured_piece is not None and captured_piece[0] == side:
+            raise ValueError(f"Destination square {move.to_square} is occupied by a friendly piece")
+
         source_mask = 1 << move.from_square
         target_mask = 1 << move.to_square
-        next_board.bitboards[color][piece] &= ~source_mask
-        for enemy_piece, bitboard in enumerate(next_board.bitboards[1 - color]):
-            if bitboard & target_mask:
-                next_board.bitboards[1 - color][enemy_piece] &= ~target_mask
-                break
-        next_board.bitboards[color][piece] |= target_mask
-        return next_board
+        previous_side_to_move = self.side_to_move
+        self.bitboards[color][piece] &= ~source_mask
+        if captured_piece is not None:
+            captured_color = self._color_index(captured_piece[0])
+            self.bitboards[captured_color][captured_piece[1]] &= ~target_mask
+        self.bitboards[color][piece] |= target_mask
+        self.side_to_move = -side
+        return MoveUndo(move, side, piece, captured_piece, previous_side_to_move)
+
+    def unmake_move(self, undo: MoveUndo) -> None:
+        color = self._color_index(undo.side)
+        source_mask = 1 << undo.move.from_square
+        target_mask = 1 << undo.move.to_square
+        self.bitboards[color][undo.piece] &= ~target_mask
+        self.bitboards[color][undo.piece] |= source_mask
+        if undo.captured_piece is not None:
+            captured_color = self._color_index(undo.captured_piece[0])
+            self.bitboards[captured_color][undo.captured_piece[1]] |= target_mask
+        self.side_to_move = undo.previous_side_to_move
 
     def evaluate(self) -> float:
         score = 0.0
@@ -223,30 +247,46 @@ def minimax(
     alpha: float = -MAX_INT,
     beta: float = MAX_INT,
 ) -> tuple[float, Move | None, Board]:
+    score, best_move, principal_variation = _minimax_search(board, depth, alpha, beta)
+    best_board = Board(board.bitboards, board.side_to_move)
+    for move in principal_variation:
+        best_board.make_move(move)
+    return score, best_move, best_board
+
+
+def _minimax_search(
+    board: Board,
+    depth: int,
+    alpha: float,
+    beta: float,
+) -> tuple[float, Move | None, tuple[Move, ...]]:
     if depth <= 0:
-        return board.evaluate(), None, board
+        return board.evaluate(), None, ()
 
     side = board.side_to_move
     moves = board.legal_moves()
     if not moves:
-        return board.evaluate(), None, board
+        return board.evaluate(), None, ()
 
     maximizing = side == WHITE
     best_score = -MAX_INT if maximizing else MAX_INT
     best_move: Move | None = None
-    best_board = board
+    best_line: tuple[Move, ...] = ()
     for move in moves:
-        child = board.make_move(move)
-        score, _, leaf_board = minimax(child, depth - 1, alpha, beta)
+        undo = board.make_move(move)
+        try:
+            score, _, line = _minimax_search(board, depth - 1, alpha, beta)
+        finally:
+            board.unmake_move(undo)
         if (maximizing and score > best_score) or (not maximizing and score < best_score):
-            best_score, best_move, best_board = score, move, leaf_board
+            best_score, best_move, best_line = score, move, (move, *line)
         if maximizing:
             alpha = max(alpha, best_score)
         else:
             beta = min(beta, best_score)
         if beta <= alpha:
             break
-    return best_score, best_move, best_board
+    return best_score, best_move, best_line
 
 
 def white_minimax(
@@ -286,7 +326,7 @@ def sim_game(board: Board, move_time: float = 4.5, max_plies: int = 100) -> Boar
             depth += 1
         if best_move is None:
             break
-        position = position.make_move(best_move)
+        position.make_move(best_move)
         print(position)
         print(f"{'White' if position.side_to_move == WHITE else 'Black'} to move")
     return position
