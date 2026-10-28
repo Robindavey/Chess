@@ -6,14 +6,19 @@ Setup:
     python app.py            ->  http://127.0.0.1:5000
 
 Set ENGINE_PATH to point at a differently named/located engine binary.
+Set CHESS_STATE_PATH to a persistent SQLite file shared by all workers.
 """
 from __future__ import annotations
 
+import json
 import math
 import os
+import sqlite3
 import subprocess
 import threading
+from contextlib import contextmanager
 from pathlib import Path
+from typing import Iterator
 
 from flask import Flask, jsonify, request
 
@@ -90,47 +95,75 @@ class Engine:
 
 engine = Engine(ENGINE_PATH)
 app = Flask(__name__)
-game_lock = threading.Lock()
-game: dict = {}
+STATE_PATH = Path(
+    os.environ.get("CHESS_STATE_PATH", HERE / "instance" / "chess.sqlite3")
+).expanduser().resolve()
+STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+with sqlite3.connect(STATE_PATH, timeout=30) as connection:
+    connection.execute("PRAGMA journal_mode=WAL")
+    connection.execute(
+        "CREATE TABLE IF NOT EXISTS game_state (id INTEGER PRIMARY KEY CHECK (id = 1), state TEXT NOT NULL)"
+    )
 
 
-def new_game(human: str, seconds: float) -> None:
-    game.clear()
-    game.update(pos=START, human=human, seconds=seconds, last=None, winner=None, ai=None)
+@contextmanager
+def locked_game() -> Iterator[dict]:
+    """Load and save the singleton game while serializing updates across workers."""
+    with sqlite3.connect(STATE_PATH, timeout=30) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        row = connection.execute("SELECT state FROM game_state WHERE id = 1").fetchone()
+        state = json.loads(row[0]) if row else {}
+        try:
+            yield state
+            if state:
+                connection.execute(
+                    "INSERT INTO game_state (id, state) VALUES (1, ?) "
+                    "ON CONFLICT(id) DO UPDATE SET state = excluded.state",
+                    (json.dumps(state),),
+                )
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
 
 
-def board_and_turn() -> tuple[str, str]:
-    board, turn = game["pos"].split()[:2]
+def new_game(human: str, seconds: float) -> dict:
+    return dict(pos=START, human=human, seconds=seconds, last=None, winner=None, ai=None)
+
+
+def board_and_turn(state: dict) -> tuple[str, str]:
+    board, turn = state["pos"].split()[:2]
     return board, turn
 
 
-def play(f: int, t: int, promotion: str | None = None) -> None:
-    board, turn = board_and_turn()
+def play(state: dict, f: int, t: int, promotion: str | None = None) -> None:
+    board, turn = board_and_turn(state)
     captured = board[t]
-    game["pos"] = engine.apply(game["pos"], f, t, promotion)
-    game["last"] = [f, t]
+    state["pos"] = engine.apply(state["pos"], f, t, promotion)
+    state["last"] = [f, t]
     if captured in "kK":
-        game["winner"] = turn
+        state["winner"] = turn
 
 
-def ai_move_if_needed() -> None:
-    _, turn = board_and_turn()
-    if game["winner"] or turn == game["human"]:
+def ai_move_if_needed(state: dict) -> None:
+    _, turn = board_and_turn(state)
+    if state["winner"] or turn == state["human"]:
         return
-    result = engine.go(game["pos"], game["seconds"])
+    result = engine.go(state["pos"], state["seconds"])
     if result is None:
-        game["winner"] = "draw"
+        state["winner"] = "draw"
         return
     f, t, score, depth, promotion = result
-    play(f, t, promotion)
-    game["ai"] = {"from": f, "to": t, "score": score, "depth": depth}
+    play(state, f, t, promotion)
+    state["ai"] = {"from": f, "to": t, "score": score, "depth": depth}
 
 
-def payload() -> dict:
-    board, turn = board_and_turn()
-    white_check, black_check, moves = engine.status(game["pos"])
-    if not game["winner"] and not moves:
-        game["winner"] = "draw"  # side to move has no moves at all
+def payload(state: dict) -> dict:
+    board, turn = board_and_turn(state)
+    white_check, black_check, moves = engine.status(state["pos"])
+    if not state["winner"] and not moves:
+        state["winner"] = "draw"  # side to move has no moves at all
 
     check = []
     if white_check and "K" in board:
@@ -138,15 +171,15 @@ def payload() -> dict:
     if black_check and "k" in board:
         check.append(board.index("k"))
 
-    human_to_move = turn == game["human"] and not game["winner"]
+    human_to_move = turn == state["human"] and not state["winner"]
     return {
         "board": list(board),
         "turn": turn,
-        "human": game["human"],
-        "seconds": game["seconds"],
-        "last": game["last"],
-        "winner": game["winner"],
-        "ai": game["ai"],
+        "human": state["human"],
+        "seconds": state["seconds"],
+        "last": state["last"],
+        "winner": state["winner"],
+        "ai": state["ai"],
         "check": check,
         "legal": moves if human_to_move else [],
     }
@@ -159,10 +192,10 @@ def index():
 
 @app.get("/api/state")
 def api_state():
-    with game_lock:
-        if not game:
-            new_game("w", 1.0)
-        return jsonify(payload())
+    with locked_game() as state:
+        if not state:
+            state.update(new_game("w", 1.0))
+        return jsonify(payload(state))
 
 
 @app.post("/api/new")
@@ -173,10 +206,11 @@ def api_new():
         seconds = requested_seconds(data, 1.0)
     except ValueError:
         return jsonify(error="invalid think time"), 400
-    with game_lock:
-        new_game(human, seconds)
-        ai_move_if_needed()  # AI opens if the human chose Black
-        return jsonify(payload())
+    with locked_game() as state:
+        state.clear()
+        state.update(new_game(human, seconds))
+        ai_move_if_needed(state)  # AI opens if the human chose Black
+        return jsonify(payload(state))
 
 
 def requested_seconds(data: dict, default: float) -> float:
@@ -196,22 +230,22 @@ def api_move():
         f, t = int(data["from"]), int(data["to"])
     except (KeyError, TypeError, ValueError):
         return jsonify(error="bad request"), 400
-    with game_lock:
-        if not game or game["winner"] or board_and_turn()[1] != game["human"]:
+    with locked_game() as state:
+        if not state or state["winner"] or board_and_turn(state)[1] != state["human"]:
             return jsonify(error="not your turn"), 409
         promotion = data.get("promotion", "-")
         if not isinstance(promotion, str) or promotion.lower() not in {"-", "q", "r", "b", "n"}:
             return jsonify(error="invalid promotion"), 400
         promotion = promotion.lower()
-        if (f, t, promotion) not in engine.status(game["pos"])[2]:
+        if (f, t, promotion) not in engine.status(state["pos"])[2]:
             return jsonify(error="illegal move"), 400
         try:
-            game["seconds"] = requested_seconds(data, game["seconds"])
+            state["seconds"] = requested_seconds(data, state["seconds"])
         except ValueError:
             return jsonify(error="invalid think time"), 400
-        play(f, t, None if promotion == "-" else promotion)
-        ai_move_if_needed()
-        return jsonify(payload())
+        play(state, f, t, None if promotion == "-" else promotion)
+        ai_move_if_needed(state)
+        return jsonify(payload(state))
 
 
 @app.errorhandler(EngineError)
